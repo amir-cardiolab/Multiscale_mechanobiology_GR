@@ -1,4 +1,5 @@
 from dolfin import *
+from dolfin.la import solver
 import numpy as np
 from numpy import linalg as LA
 import numpy
@@ -8,12 +9,8 @@ import argparse
 import glob
 import re
 import math
-from scipy.integrate import solve_ivp
-from scipy.integrate import odeint
 import matplotlib.pyplot as plt 
 from mshr import *
-from scipy.integrate import ode 
-from petsc4py import PETSc
 from mpi4py import MPI
 import ufl
 import os
@@ -22,13 +19,31 @@ import os
 comm = MPI.COMM_WORLD
 rank = comm.Get_rank()
 
+n_Hill	= 1.2
+tau_Hill 	= 1.0
+Ymax_Hill 	= 1.0
+w_Hill 		= 1.0
+EC50_Hill	= 0.5
+En_Hill = pow(EC50_Hill,n_Hill)
+Beta_Hill = (En_Hill - 1.0) / (2.0 * En_Hill - 1.0)
+Km_Hill = pow((Beta_Hill - 1.0), (1.0 / n_Hill))
+Kn_Hill = pow(Km_Hill,n_Hill)
+
 class Species:
-    def __init__(self,y,n,tau,EC50,i):
-        self.y = y
-        self.n = n
-        self.tau = tau
-        self.EC50 = EC50
-        self.i = i
+    def __init__(self):
+        self.c = Function(Vs_cg)
+        
+    def update(self,u_i):
+        self.c.assign(project(u_i,Vs_cg,solver_type="gmres"))
+        
+    def cn(self):
+        return Expression('max(pow(c,n),0.0)',c=self.c,n=Constant(n_Hill), degree=2)
+
+    def act(self,activator):
+        return Expression('(Beta * cn) / (Kn + cn)',Beta=Constant(Beta_Hill), cn=activator.cn(), Kn=Constant(Kn_Hill), degree=2)
+
+    def inh(self,inhibitor):
+        return Expression('max(1.0 - fa,0.0)',fa=self.act(inhibitor), degree=2)
 
 #----------------------------------------------------------------------------------------------------
 #FORM COMPILER SETTINGS
@@ -49,45 +64,50 @@ ffc_options = {'optimize' : True,
 
 output_dir = os.path.splitext(os.path.dirname(__file__))[0] + '/'
 file_name = os.path.splitext(os.path.basename(__file__))[0]
-file_name = file_name + '_10years'
+
+#----------------------------------------------------------------------------------------------------
+#FLAGS
+#----------------------------------------------------------------------------------------------------
+
+bool_reference_growth_dir = True
 
 #----------------------------------------------------------------------------------------------------
 #MESH INITIALIZATION
 #----------------------------------------------------------------------------------------------------
 
-#Begin mesh values
-x0 = 0.0
-y0 = 0.0
-z0 = 0.0
+if rank == 0:
+    print ('reading mesh')
 
-#End mesh values
-z1 = 3.0
+bmesh = Mesh('./Tube_Mesh.xml')
 
-outer_tube = Cylinder(Point(x0, y0, z0),Point(x0,y0,z1),0.65,0.65)
-inner_tube = Cylinder(Point(x0, y0, z0),Point(x0,y0,z1),0.49,0.49)
-half_cut = Box(Point(-1.0,-1.0,z0),Point(0.0,1.0,z1))
-quarter_cut = Box(Point(-1.0,-1.0,z0),Point(1.0,0.0,z1))
-geometry = outer_tube - inner_tube - half_cut - quarter_cut
-
-domain = CSGCGALDomain3D(geometry)
-generator = TetgenMeshGenerator3D()
-generator.parameters["mesh_resolution"] = 200.0
-bmesh = refine(generator.generate(domain),True)
-
-File(comm, output_dir + file_name + "_cylinder.pvd") << bmesh
+sub_domain_ref = MeshFunction("bool", bmesh, bmesh.topology().dim() - 1)
+sub_domain_ref.set_all(0)
 
 #----------------------------------------------------------------------------------------------------
-#FUNCTION SPACE INITIALIZATION
+#FUNCTION SPACE INITIALIZATION AND GLOBAL/LOCAL NODE INTERFACE FOR PARALLEL RUNS
 #----------------------------------------------------------------------------------------------------
 
-n_elem = bmesh.num_cells()
+# displacement function spaces
 Vs_cg = FunctionSpace(bmesh,'CG',2)
 Vs_dg = FunctionSpace(bmesh,'DG',0)
 Vv = VectorFunctionSpace(bmesh,'Lagrange',2)
 Vt = TensorFunctionSpace(bmesh,'Lagrange',2)
+# chemical element and function spaces
+P1 = FiniteElement('P', bmesh.ufl_cell(), 1)
+chem_element = MixedElement([P1, P1, P1, P1])
+Vc = FunctionSpace(bmesh, chem_element)
 
+# global node numbers (better for 1 processor)
+global_node_num= bmesh.num_vertices()
+
+#local node number (better for more than 1 processor)
 local_range = Vs_cg.dofmap().ownership_range()
 local_dim = local_range[1] - local_range[0]
+
+# element numbers
+n_elem = bmesh.num_cells()
+# coordinates of each node. 
+coord = Vs_cg.tabulate_dof_coordinates()
 
 #----------------------------------------------------------------------------------------------------
 #BC INITIALIZATION
@@ -103,7 +123,7 @@ class y_axis(SubDomain):
 
 class z_faces(SubDomain):
     def inside(self, x, on_boundary):
-        return (on_boundary and near(x[2], 3)) or (on_boundary and near(x[2],0))
+        return ((on_boundary and near(x[2], 3.0,0.01)) or (on_boundary and near(x[2], 0.0,0.01)))
 
 class intimal_wall(SubDomain):
     def inside(self, x, on_boundary):
@@ -130,118 +150,92 @@ zfix.mark(sub_domains, 3)
 intima_pressure_bc = intimal_wall()
 intima_pressure_bc.mark(sub_domains, 4)
 
-file_BC_default = File(comm, output_dir + file_name + "_subdomains.pvd")
-file_BC_default << sub_domains
+# Symmetry BC: Fix y axis in the x direction
+bcx = DirichletBC(Vv.sub(1), Constant(0.0), y_ax_fix)
+# Symmetry BC: Fix x axis in the y direction
+bcy = DirichletBC(Vv.sub(0), Constant(0.0), x_ax_fix)
+# Symmetry BC: Fix motion in the z direction on nodes where z = 0
+bcz = DirichletBC(Vv.sub(2), Constant(0.0), zfix)
 
-n_elem = bmesh.num_cells()
+bcs_b = [bcx,bcy,bcz]
+
+#----------------------------------------------------------------------------------------------------
+#TIME STEPPING PARAMETERS
+#----------------------------------------------------------------------------------------------------
+num_cycle = 240
+count = 0
+ctime = 0.0
+simulation_length = 8.0
+
+year = 365.0 * 24.0 * 3600.0
+tspan = simulation_length * year
+
+#output every 0.5 years
+plot_step = num_cycle / (simulation_length * 2)
+
+dt = tspan / num_cycle
+
+def years(t): 
+    return t / 3.154e7
+
+# convert y^-1 to s^-1
+k = Constant(1.0 / year)
+k_r = Function(Vs_cg)
 
 #----------------------------------------------------------------------------------------------------
 #CHEMICAL SPECIES INITIALIZATION AND ODE SYSTEM DEFINITION
 #----------------------------------------------------------------------------------------------------
 
-node_numbers = bmesh.num_vertices()
-element_numbers = bmesh.num_cells()
-connectivity_matrix = bmesh.cells()
-
-local_range = Vs_cg.dofmap().ownership_range()
-local_dim = local_range[1] - local_range[0]
-vert = vertices(bmesh)
-
-coordinate = Vs_cg.tabulate_dof_coordinates()
-TGFB_source_np = np.zeros((local_dim))
-growth_mult = 2.5
+#initialize vector for growth rate and previous growth rate.
 growth_rate = Function(Vs_cg)
-growth_rate.vector().set_local(TGFB_source_np * growth_mult)
-growth_rate.vector().apply('insert')
-
-n 		= 1.2
-tau 	= 1.0
-Ymax 	= 1.0
-w 		= 1.0
-EC50	= 0.5
-
-for i in range (local_dim):
-    z_point=coordinate[i][2]
-    TGFB_source_np[i] = 0.5 * exp(-abs(pow(z_point,3.0)) / 3.0)
-
-def ODEfunc(t,y,z,k):
-
-    TGFB = Species(z,n,tau,EC50,-1)
-    MAPK = Species(y[0],n,tau,EC50,0)
-    Smad = Species(y[1],n,tau,EC50,1)
-    MMP = Species(y[2],n,tau,EC50,2)
-    TIMP = Species(y[3],n,tau,EC50,3)
-
-    dydt 		= np.zeros(4) 
-
-    dydt[MAPK.i] 	= (k * ((w * activation(TGFB,MAPK) * Ymax) - MAPK.y) / MAPK.tau)
-
-    dydt[Smad.i] 	= (k * ((w * activation(TGFB,Smad) * Ymax) - Smad.y) / Smad.tau)
-
-    dydt[MMP.i] 	= (k * ((w * inhibition(TIMP,MMP)  * activation(MAPK,MMP) 
-                                * Ymax) 
-                             - MMP.y)
-                         / MMP.tau
-    )
-
-    dydt[TIMP.i] 	= (k * ((w * activation(Smad,TIMP) * Ymax) - TIMP.y) / TIMP.tau)
-
-    return dydt
 
 #----------------------------------------------------------------------------------------------------
 #MATERIAL MODEL PARAMETERS
 #----------------------------------------------------------------------------------------------------
 
-def activation(activator,activated): 
-    # hill activation function with parameters w (weight), n (Hill coeff), EC50
-
-    En = pow(activator.EC50, activator.n)
-    Beta = (En - 1.0) / (2.0 * En - 1.0)
-    Km = pow((Beta - 1.0), (1.0 / activator.n))
-    cn = pow(activator.y, activator.n)
-    Kn = pow(Km, activator.n)
-    f_act = (Beta * cn) / (Kn + cn)
-
-    return f_act
- 
-def inhibition(inhibitor,inhibited): 
-    # inverse hill function with parameters w (weight), n (Hill coeff), EC50 
-    f_inhib = 1 - activation(inhibitor,inhibited) 
-    return f_inhib
-
-######### Material parameters   ################
-rho = 1100e12
-m_C1 = 10.0 / 6.0
-m_C2 = -m_C1 / 2.0 #chosen so that the initial stress is 0
-Kappa_incomp = 16.111
-
+# neo-Hookean material parameters
 C1 = Function(Vs_dg)
 C2 = Function(Vs_dg)
-Kappa = Function(Vs_cg)
+Kappa = Function(Vs_dg)
 
-C1.vector().set_local(np.zeros(n_elem) + m_C1)
-C2.vector().set_local(np.zeros(n_elem) + m_C2)
-temp_array_Kappa = Kappa.vector().get_local() 
-temp_array_Kappa[:] = Kappa_incomp
-Kappa.vector().set_local(temp_array_Kappa)
+# Define trial/test functions
+u_s = Function(Vc)
+u_n = Function(Vc)
+u_1, u_2, u_3, u_4 = split(u_s)
+u_n1, u_n2, u_n3, u_n4 = split(u_n)
+v_1, v_2 , v_3, v_4 = TestFunctions(Vc)
+# Define expressions used in variational forms
+ht = Constant(dt)
+kd = Constant(1.0)
+D = Constant(1e-20)
 
+k_bp = Function(Vs_cg)
+phi_me = Function(Vs_cg)
 
-#fix motion in the x direction on nodes where y = 0
-bcx = DirichletBC(Vv.sub(1), Constant(0.0), y_ax_fix)
-#fix motion in the y direction on nodes where x = 0
-bcy = DirichletBC(Vv.sub(0), Constant(0.0), x_ax_fix)
-#fix motion in the z direction on nodes where z = 0
-bcz = DirichletBC(Vv.sub(2), Constant(0.0), zfix)
+f0 = Function(Vv)
+f_TGFB = Expression('0.5*exp(-abs(pow(x[2],3.0))/3.0)',degree=3)
+TGFB = Species()
+MAPK = Species()
+Smad = Species()
+MMP = Species()
+TIMP = Species()
 
-bcs_b = [bcx, bcy, bcz]
-
-# Trial and test functions
-du_b = TrialFunction(Vv)   # displacement
-vb = TestFunction(Vv)
-ub = Function(Vv) # the most recently computed solution
-vel0, a0 , ub0 = Function(Vv), Function(Vv), Function(Vv)
-n_function = FacetNormal(bmesh)
-h = CellDiameter(bmesh)
+# initial BCs
+if count == 0:
+    C1.assign(Constant(1.6667))
+    C2.assign(Constant(0.0))
+    k_r.assign(Constant(1.0/year))
+    Kappa.assign(Constant(1.0))
+    u_n.assign(project(Expression(('0.0','0.0','0.0','0.0'),degree=1), Vc, solver_type="gmres"))
+    growth_rate.assign(project(Expression('1.0',degree=1), Vs_cg, solver_type="gmres"))
+    TGFB.update(f_TGFB)
+    MAPK.update(u_n1)
+    Smad.update(u_n2)
+    MMP.update(u_n3)
+    TIMP.update(u_n4)
+    k_bp.assign(project(Expression('1.0',degree=1), Vs_cg, solver_type="gmres"))
+    phi_me.assign(project(Expression('0.0',degree=1), Vs_cg, solver_type="gmres"))
+    f0.assign(project(Expression(('0.0','0.0','1.0'),degree=1), Vv, solver_type="gmres"))
 
 #----------------------------------------------------------------------------------------------------
 #MECHANICAL MODEL
@@ -251,26 +245,42 @@ h = CellDiameter(bmesh)
 du_b = TrialFunction(Vv)
 vb = TestFunction(Vv)
 ub = Function(Vv) # the most recently computed solution
+n_function = FacetNormal(bmesh)
+h = CellDiameter(bmesh)
+dx = ufl.Measure('dx', domain=bmesh, metadata={'quadrature_degree': 5})
+ds = Measure('ds', domain = bmesh, subdomain_data = sub_domains)
 
+#kinematics
+d = len(ub)
 #identity
 I = ufl.variable(ufl.Identity(3))
 
 # Hyperelasticity
 # Deformation gradients and Jacobians
 gradu = ufl.variable(ufl.grad(ub))
-F_t = ufl.variable(I + gradu)
-J_t = ufl.variable(ufl.det(F_t))
-F_g = ufl.variable(I + as_tensor([[growth_rate, 0, 0 ],[0, growth_rate, 0],[0, 0, 0]]))
+F = ufl.variable(I + gradu)
+J = ufl.variable(ufl.det(F))
+E = ufl.variable(0.5 * (ufl.dot(F.T, F) - I))
+
+if bool_reference_growth_dir:
+    theta_normal = f0
+    theta_normal = theta_normal / sqrt(ufl.dot(theta_normal,theta_normal))
+else:
+    theta_normal = F * f0
+    theta_normal = theta_normal / sqrt(ufl.dot(theta_normal,theta_normal))
+
+nxn = ufl.variable(ufl.outer(theta_normal,theta_normal))
+F_g = ufl.variable((sqrt(growth_rate) * I) + (1.0 - sqrt(growth_rate)) * nxn)
 F_gi = ufl.variable(ufl.inv(F_g))
 J_g = ufl.variable(ufl.det(F_g))
-F_e = ufl.variable(F_t * F_gi)
-J_e = ufl.variable(J_t * ufl.inv(J_g))
+F_e = ufl.variable(F * F_gi)
+J_e = ufl.variable(J * ufl.inv(J_g))
+F_i = ufl.variable(ufl.inv(F))
 
 # Strain and stretch tensor
 C_e = ufl.variable(ufl.dot(F_e.T, F_e))
 I1 = ufl.variable(ufl.tr(C_e))
 I2 =  ufl.variable(0.5 * (ufl.tr(C_e)**2 - ufl.tr(C_e * C_e)))
-E_e = ufl.variable(0.5 * (ufl.dot(F_e.T, F_e) - I))
 
 # Mooney-Rivlin Coupled hyperelastic solid
 Wc = (I * C1) + (I * C2 * I1) - (C2 * C_e)
@@ -279,16 +289,18 @@ Wj = -1.0 * J_e * p * ufl.inv(C_e)
 
 # Stress measurements
 second_PK_stress_E = 2.0 * Wc + Wj
-cauchy_stress = (1.0 / J_e) * F_e * second_PK_stress_E * F_e.T
+second_PK_stress = J_g * F_gi * second_PK_stress_E * F_gi.T
+first_PK_stress = F * second_PK_stress
+cauchy_stress = (1.0 / J) * first_PK_stress * F.T
+cauchy_stress_I1 = ufl.variable(ufl.tr(cauchy_stress))
+cauchy_stress_I2 = ufl.variable(0.5 * (ufl.tr(cauchy_stress)**2-ufl.tr(cauchy_stress * cauchy_stress)))
+cauchy_stress_I3 = ufl.variable(det(cauchy_stress))
 
 P_wall = Function(Vs_dg)
-
+# Making weak form
 dx = dx(metadata={'quadrature_degree': 5})
-ds = Measure('ds', domain = bmesh, subdomain_data = sub_domains)
-
-Functional_b_isotropic = (inner(dot(F_e,second_PK_stress_E),grad(vb)) * dx() + P_wall * J_e * inner(inv(F_e.T) * n_function,vb) * ds(4))
-
-J_b_isotropic = derivative(Functional_b_isotropic, ub, du_b)
+Functional_b_isotropic = ufl.inner(first_PK_stress,ufl.grad(vb)) * dx() + P_wall * J * inner(inv(F.T) * n_function,vb) * ds(4)
+J_b_isotropic = derivative(Functional_b_isotropic,ub,du_b)
 
 if rank == 0:
     print ('Assembling solver...')
@@ -296,7 +308,16 @@ if rank == 0:
 problem_isotropic = NonlinearVariationalProblem(Functional_b_isotropic, ub, bcs_b, J_b_isotropic)
 solver = NonlinearVariationalSolver(problem_isotropic)
 
-file_isotropic_ub = File(comm, output_dir + file_name + 'displacement_multi.pvd')
+# LHS - RHS
+# partial derivatives
+# sources
+# sinks
+# reactions
+
+Fc   = (((u_1 - u_n1) / ht) * v_1) * dx + (D * dot(grad(u_1),grad(v_1))) * dx - (k_r * MAPK.act(TGFB) * v_1) * dx + (k_r * kd * u_1 * v_1) * dx\
+    + (((u_2 - u_n2) / ht) * v_2) * dx + (D * dot(grad(u_2),grad(v_2))) * dx - (k_r * Smad.act(TGFB) * v_2) * dx + (k_r * kd * u_2 * v_2) * dx\
+    + (((u_3 - u_n3) / ht) * v_3) * dx + (D * dot(grad(u_3),grad(v_3))) * dx - (k_r * MMP.inh(TIMP) * MMP.act(MAPK) * v_3) * dx + (k_r * kd * u_3 * v_3) * dx\
+    + (((u_4 - u_n4) / ht) * v_4) * dx + (D * dot(grad(u_4),grad(v_4))) * dx - (k_r * TIMP.act(Smad) * v_4) * dx + (k_r * kd * u_4 * v_4) * dx
 
 #----------------------------------------------------------------------------------------------------
 #SOLVER PARAMETERS MODEL
@@ -308,7 +329,6 @@ prm["newton_solver"]["krylov_solver"]["nonzero_initial_guess"] = False
 prm['newton_solver']['absolute_tolerance'] = 1E-5
 prm['newton_solver']['relative_tolerance'] = 1E-5
 prm['newton_solver']['linear_solver'] = 'gmres'
-prm['newton_solver']['preconditioner'] = 'hypre_amg'
 prm['newton_solver']['krylov_solver']['maximum_iterations'] = 20000
 prm['newton_solver']['krylov_solver']['absolute_tolerance'] = 1e-5
 prm['newton_solver']['krylov_solver']['relative_tolerance'] = 1e-5
@@ -321,105 +341,119 @@ Time_array = numpy.array([0,10])
 P_aort_array = numpy.array([0,0.016])
 
 #----------------------------------------------------------------------------------------------------
-#TIME STEPPING PARAMETERS
-#----------------------------------------------------------------------------------------------------
-num_cycle = 160
-count = 0
-ctime = 0.0
-simulation_length = 8
-
-year = 365.0 * 24.0 * 3600.0
-tspan = simulation_length * year
-
-#output every 0.5 years
-plot_step = num_cycle / (simulation_length * 2)
-
-dt = tspan / num_cycle
-
-init = np.zeros((local_dim,4))
-k = 1.0 / year
-
-def years(t): 
-    return t / year
-
-# inverse of 10 years in seconds so that reaction completes at 10 yrs
-k = 1.0 / year
-
-#----------------------------------------------------------------------------------------------------
 #STATE VARIABLE FUNCTION INITIALIZATION
 #----------------------------------------------------------------------------------------------------
 
-CauchyS = Function(Vt) # the most recently computed solution
-pout = Function(Vs_cg)
-ctrace = Function(Vs_cg)
-growth_out = Function(Vs_cg)
+# output functions for visualization.
+CauchyS = Function(Vt)
+LagrangeS = Function(Vt)
+pressure = Function(Vs_cg)
+Cauchy1stPRout = Function(Vv)
+CauchyI1 = Function(Vs_cg)
+CauchyI2 = Function(Vs_cg)
+CauchyI3 = Function(Vs_cg)
+Jout = Function(Vs_cg)
 Jeout = Function(Vs_cg)
 Jgout = Function(Vs_cg)
-Jtout = Function(Vs_cg)
+growth_out = Function(Vs_cg)
+k_out = Function(Vs_cg)
+phi_out = Function(Vs_cg)
+f0_out = Function(Vv)
+growth_tens_out = Function(Vs_cg)
+normal_out = Function(Vs_cg)
 
-
-# Chemical species
-TGFB_sp = Function(Vs_cg)
-TGFB_sp.vector().set_local(TGFB_source_np)
-TGFB_sp.vector().apply('insert')
-MAPK_sp = Function(Vs_cg)
-Smad_sp = Function(Vs_cg)
-MMP_sp  = Function(Vs_cg)
-TIMP_sp = Function(Vs_cg)
-
-# Intimal wall pressurization
-def init_pressurization():
-    count_init = 0
-    while count_init < 10:
-            count_init += 1
-            temp_array_P_wall = P_wall.vector().get_local()
-            P_current_wall = np.interp(count_init,Time_array,P_aort_array)
-            temp_array_P_wall[:] = P_current_wall
-            P_wall.vector().set_local(temp_array_P_wall)
-            P_wall.vector().apply('insert')
-            if rank ==0 :
-                print('Pressurizing to ', P_current_wall, '. initialization step ',count_init)
-            solver.solve()
-            UpdateStressVals()
 
 #----------------------------------------------------------------------------------------------------
 #STATE VARIABLE UPDATE FUNCTIONS
 #----------------------------------------------------------------------------------------------------
 
 def UpdateStressVals():
-    CauchyS.assign(project(cauchy_stress, Vt, solver_type="gmres", preconditioner_type="hypre_amg"))
+    CauchyS.assign(project(cauchy_stress, Vt, solver_type="gmres"))
     CauchyS.vector().apply('insert')
-    pout.assign(project(p, Vs_cg, solver_type="gmres", preconditioner_type="hypre_amg"))
-    pout.vector().apply('insert')
-    ctrace.assign(project(tr(cauchy_stress), Vs_cg, solver_type="gmres", preconditioner_type="hypre_amg"))
-    ctrace.vector().apply('insert')
-    growth_out.assign(project(growth_rate, Vs_cg, solver_type="gmres", preconditioner_type="hypre_amg"))
+    LagrangeS.assign(project(E, Vt, solver_type="gmres"))
+    LagrangeS.vector().apply('insert')
+    pressure.assign(project(-(1.0 / 3.0) * tr(cauchy_stress), Vs_cg, solver_type="gmres"))
+    pressure.vector().apply('insert')
+    CauchyI1.assign(project(cauchy_stress_I1, Vs_cg, solver_type="gmres"))
+    CauchyI1.vector().apply('insert')
+    CauchyI2.assign(project(cauchy_stress_I2, Vs_cg, solver_type="gmres"))
+    CauchyI2.vector().apply('insert')
+    CauchyI3.assign(project(cauchy_stress_I3, Vs_cg, solver_type="gmres"))
+    CauchyI3.vector().apply('insert')
+    growth_out.assign(project(growth_rate, Vs_cg, solver_type="gmres"))
     growth_out.vector().apply('insert')    
-    Jtout.assign(project(J_t, Vs_cg, solver_type="gmres", preconditioner_type="hypre_amg"))
-    Jtout.vector().apply('insert')
-    Jeout.assign(project(J_e, Vs_cg, solver_type="gmres", preconditioner_type="hypre_amg"))
+    Jout.assign(project(J, Vs_cg, solver_type="gmres"))
+    Jout.vector().apply('insert')
+    Jeout.assign(project(J_e, Vs_cg, solver_type="gmres"))
     Jeout.vector().apply('insert')
-    Jgout.assign(project(J_g, Vs_cg, solver_type="tfqmr", preconditioner_type="petsc_amg"))
+    Jgout.assign(project(J_g, Vs_cg, solver_type="gmres"))
     Jgout.vector().apply('insert')
+    k_out.assign(project(k_bp, Vs_cg, solver_type="gmres"))
+    phi_out.assign(project(phi_me, Vs_cg, solver_type="gmres"))
+    f0_out.assign(project(f0, Vv, solver_type="gmres"))
+    f0_out.vector().apply('insert')
+    normal_out.assign(project(theta_normal, Vv, solver_type="gmres"))
+    normal_out.vector().apply('insert')
+    growth_tens_out.assign(project(F_g, Vt, solver_type="gmres"))
+    growth_tens_out.vector().apply('insert')
 
-def UpdateSpeciesVals(new_vals):
-    MAPK_sp.vector().set_local(new_vals[:,0])
-    MAPK_sp.vector().apply('insert')
-    Smad_sp.vector().set_local(new_vals[:,1])
-    Smad_sp.vector().apply('insert')
-    MMP_sp.vector().set_local(new_vals[:,2])
-    MMP_sp.vector().apply('insert')
-    TIMP_sp.vector().set_local(new_vals[:,3])
-    TIMP_sp.vector().apply('insert')
-    growth_rate.assign(MMP_sp * growth_mult)
-    growth_rate.vector().apply('insert')
+def UpdateSpeciesVals():
+    _u_1, _u_2, _u_3, _u_4 = split(u_s)
+    _u_n1, _u_n2, _u_n3, _u_n4 = split(u_n)
+    MAPK.update(_u_1)
+    Smad.update(_u_2)
+    MMP.update(_u_3)
+    TIMP.update(_u_4)
+    sigmoid_act = Expression('1.0/(1.0+exp(-(theta-t_a)/gamma))', theta=Function(Vs_cg), t_a=Constant(-3.0), gamma=Constant(0.3), degree=1)
+    sigmoid_inh = Expression('1.0/(1.0+exp(-(theta+t_a)/gamma))', theta=Function(Vs_cg), t_a=Constant(-3.0), gamma=Constant(0.3), degree=1)
+    s_act = Function(Vs_cg)
+    s_inh = Function(Vs_cg)
+    sigmoid_act.theta = growth_rate
+    sigmoid_inh.theta = growth_rate
+    s_act.interpolate(sigmoid_act)
+    s_inh.interpolate(sigmoid_inh)
+    K_bandpass = Expression('theta_min + theta_max * (s_act - s_inh)', theta_min=Constant(0.0), theta_max=Constant(1.0), s_act=Function(Vs_cg), s_inh=Function(Vs_cg), degree=1)
+    K_bandpass.s_act = s_act
+    K_bandpass.s_inh = s_inh
+    k_bp.interpolate(K_bandpass)
+    dCdt = Expression('phi_a*(C-Cn)/dt', phi_a=Constant(6.5), C=Function(Vs_cg), Cn=Function(Vs_cg), dt=Constant(dt), degree=1)
+    dCdt.C = project(_u_3,Vs_cg, solver_type="gmres")
+    dCdt.Cn = project(_u_n3,Vs_cg, solver_type="gmres")
+    phi_me.interpolate(dCdt)
+    growth_rate.assign(project((growth_rate + (k_bp * phi_me * dt)),Vs_cg, solver_type="gmres"))
+    u_n.assign(u_s)
+    
+#----------------------------------------------------------------------------------------------------
+def init_pressurization():
+    prm['newton_solver']['absolute_tolerance'] = 1E-9
+    prm['newton_solver']['relative_tolerance'] = 1E-9
+    prm['newton_solver']['krylov_solver']['absolute_tolerance'] = 1e-9
+    prm['newton_solver']['krylov_solver']['relative_tolerance'] = 1e-9
+    count_init = 0
+    count_end = 10
+    P_init = 0.016
+    while count_init < 10:
+            count_init += 1
+            P_current_wall = P_init * count_init / count_end
+            if rank ==0 :
+                print("Initialization step ",count_init, "pressurizing to ",P_current_wall,".\n")
+            P_wall.assign(Constant(P_current_wall))
+            solver.solve()
+            UpdateStressVals()
+    prm['newton_solver']['absolute_tolerance'] = 1E-5
+    prm['newton_solver']['relative_tolerance'] = 1E-5
+    prm['newton_solver']['krylov_solver']['absolute_tolerance'] = 1e-5
+    prm['newton_solver']['krylov_solver']['relative_tolerance'] = 1e-5
 
+#----------------------------------------------------------------------------------------------------
 #I/O FUNCTIONS
 #----------------------------------------------------------------------------------------------------
-
-xdmf_var_fields = { "displacement":ub, "Cauchy Stress":CauchyS, "Pressure":pout,\
-                    "ctrace":ctrace, "growth rate":growth_out, "J_e": Jeout, "J_t": Jtout, "J_g": Jgout,\
-                    "[TGFB]":TGFB_sp, "[MAPK]":MAPK_sp, "[Smad]": Smad_sp, "[MMP]": MMP_sp, "[TIMP]": TIMP_sp\
+xdmf_var_fields = {"displacement":ub, "Lagrange Strain":LagrangeS, "Cauchy Stress":CauchyS, "Pressure":pressure,\
+                    "stress I1": CauchyI1, "stress I2": CauchyI2, "stress I3":CauchyI3,\
+                    "growth rate":growth_out, "J_e": Jeout, "J_t": Jout, "J_g": Jgout,\
+                    "[TGFB]":TGFB.c, "[MAPK]":MAPK.c, "[Smad]": Smad.c, "[MMP]": MMP.c, "[TIMP]": TIMP.c,\
+                    "k_bp":k_out, "phi":phi_out,\
+                    "f0":f0_out, "growth_tens":growth_tens_out, "normal vector":normal_out\
 }
 
 def init_xdmffile(f_xdmf,fields):
@@ -441,8 +475,8 @@ xdmffile_u.parameters["functions_share_mesh"] = True
 #MODEL INITIALIZATION
 #----------------------------------------------------------------------------------------------------
 
+init_pressurization()
 UpdateStressVals()
-comm.barrier()
 init_xdmffile(xdmffile_u,xdmf_var_fields)
 start_time = time.perf_counter()
 
@@ -451,47 +485,38 @@ start_time = time.perf_counter()
 #----------------------------------------------------------------------------------------------------
 
 if rank == 0:
-    print ('Entering loop:')
+    start = time.time()
+    print("Started solution")
+    print ('Entering loop:',flush=True)
 
 while count < num_cycle:
     if rank == 0:
-        print("\nstep = ",count + 1,", start time = ", years(ctime)," end time = ",years(ctime+dt),"\n")
+        print("\nstep = ",count + 1,", start time = ", years(ctime)," end time = ",years(ctime+dt),"\n",flush=True)
 
-    #solve for chemical equilibrium
-    for i in range (len(TGFB_source_np)):
-        r = ode(ODEfunc).set_integrator('vode', method='adams', 
-                                        order=15, rtol=1e-12, atol=1e-12,
-                                        with_jacobian=True)
-        args_iv = [[init[i,0],init[i,1],init[i,2],init[i,3]],ctime]
-        args_params = [TGFB_source_np[i],k]
-        r.set_initial_value(*args_iv).set_f_params(*args_params)
-        results = np.empty([0,4])
-        while r.successful() and r.t < ctime + dt:
-            r.integrate(r.t + dt)
-            results = np.append(results,[r.y],axis = 0)
-        init[i,0]   = results[-1,0]
-        init[i,1]   = results[-1,1]
-        init[i,2]   = results[-1,2]
-        init[i,3]   = results[-1,3]
+    solve(Fc == 0, u_s, solver_parameters={"newton_solver":{"relative_tolerance":1e-20, "absolute_tolerance": 1e-20}})
 
     #update chemical species
-    UpdateSpeciesVals(init)
+    if rank == 0:
+        print("\nUpdating chemical species\n")
+    UpdateSpeciesVals()
 
     #solve mechanical problem
     solver.solve()
-    
-    #update mechnical state variables
-    UpdateStressVals()
 
+    #update mechnical state variables
+    if rank == 0:
+        print("\nUpdating mechanical dof\n")
+    UpdateStressVals()
+    
     #increment time, output results every 0.5 years
     count += 1
     ctime += dt
 
-    comm.barrier()
     if count > 0 and count % plot_step == 0:
         if rank == 0:
-            print("\nWriting step ",count," at time = ",years(ctime),"\n")
+            print("\nWriting step ",count," at time = ",years(ctime),"\n",flush=True)
         write_xdmffile(xdmffile_u,xdmf_var_fields)
 
 if rank == 0:
     print('Done!')
+    print("Finished solution in %f seconds"%(time.time()-start))
